@@ -1,0 +1,15 @@
+# Arduino build output
+build/
+*.bin
+*.elf
+*.map
+
+# Font sources — regenerate headers with tools/ttf2gfx.py instead
+*.ttf
+*.otf
+
+# Editor / OS noise
+.vscode/
+.DS_Store
+Thumbs.db
+*~
