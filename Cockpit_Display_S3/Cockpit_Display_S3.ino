@@ -45,6 +45,8 @@
 
 #include <LovyanGFX.hpp>
 #include <MAVLink.h>
+#include <WiFi.h>
+#include <WiFiUdp.h>
 #include <math.h>
 
 // B612, the typeface Airbus and ENAC designed for cockpit screens.
@@ -115,16 +117,102 @@ const bool USE_PSRAM = false;             // default: false
 //  Flight controller link
 // ---------------------------------------------------------------------
 
-// RX receives the flight controller's TX. TX is set up but never used
-// to send anything, so it does not need to be wired.
+// RX receives the flight controller's TX.
+// TX only needs to be wired if you use the WiFi bridge below; the
+// display itself never talks back.
 const int MAV_RX_PIN = 44;            // default: 44
 const int MAV_TX_PIN = 43;            // default: 43
 const uint32_t MAV_BAUD = 115200;     // default: 115200
+
+// Serial receive buffer, in bytes. This has to cover the time the
+// board spends pushing a frame, around 25 ms, because nothing is read
+// off the port while that happens. The Arduino default of 256 bytes is
+// only 22 ms at 115200 and does not cover it once a ground station is
+// also pulling parameters.
+//
+//   buffer   holds at 115200   holds at 921600
+//     256           22 ms             3 ms     <- the default; too small
+//    2048          178 ms            22 ms     <- too tight at 921600
+//    8192          711 ms            89 ms     <- comfortable at both
+//
+// If you raise SERIALn_BAUD on the flight controller, keep an eye on
+// the right-hand column.
+const size_t MAV_RX_BUFFER = 8192;    // default: 8192
+
+// Serial transmit buffer, in bytes. Without one, writing to the port
+// blocks until the hardware has clocked the bytes out, which at 115200
+// is about 9 ms for every 100 bytes - long enough to stall a frame.
+// With a buffer, writes return immediately until it is full.
+const size_t MAV_TX_BUFFER = 2048;    // default: 2048
 
 // Demo-mode button, active low with an internal pull-up. GPIO 0 is the
 // BOOT button on essentially every ESP32-S3 board. -1 disables it.
 const int BUTTON_PIN = 0;                 // default: 0
 const uint32_t BUTTON_DEBOUNCE_MS = 40;   // default: 40
+
+// ---------------------------------------------------------------------
+//  WiFi MAVLink bridge
+// ---------------------------------------------------------------------
+
+// Lets Mission Planner, QGroundControl or MAVProxy reach the flight
+// controller over WiFi, through this board, while the cockpit display
+// carries on as normal. The bridge forwards raw MAVLink bytes in both
+// directions and does not care what is in them, so MAVLink 2, signing
+// and any dialect all pass through untouched.
+//
+//   *** THIS NEEDS ONE EXTRA WIRE ***
+//
+// The display only ever listens, so a display-only build needs just
+// the flight controller's TX. A ground station has to talk back, so
+// the board's TX must now reach the flight controller's RX:
+//
+//     ESP32-S3 GPIO 43 (TX)  ->  flight controller telemetry RX
+//
+// Without that wire you still get live telemetry in Mission Planner,
+// but it will sit at "getting params" forever and you will not be able
+// to change anything on the aircraft.
+//
+// Set this false to get the display-only build back, with no WiFi
+// started and no radio power drawn.
+const bool WIFI_BRIDGE_ENABLE = true;        // default: true
+
+// BRIDGE_AP  - the board makes its own network. Best in the field: no
+//              router needed, and the board is always at 192.168.4.1.
+// BRIDGE_STA - the board joins a network you already have. Best at the
+//              bench, and lets you stay on the internet at the same
+//              time. If it cannot join within WIFI_STA_TIMEOUT_MS the
+//              sketch gives up and runs as a plain display.
+#define BRIDGE_AP   1
+#define BRIDGE_STA  2
+#define WIFI_BRIDGE_MODE  BRIDGE_AP          // default: BRIDGE_AP
+
+// In BRIDGE_AP mode: the network the board creates.
+// In BRIDGE_STA mode: the network it joins.
+// The password must be at least 8 characters. In AP mode an empty
+// string makes an open network, which also lets anyone within range
+// command your aircraft, so set one.
+const char* WIFI_SSID = "cockpit-display";   // default: cockpit-display
+const char* WIFI_PASS = "fpvcockpit";        // default: fpvcockpit
+
+const uint32_t WIFI_STA_TIMEOUT_MS = 12000;  // default: 12000
+const uint8_t  WIFI_AP_CHANNEL = 6;          // default: 6
+
+// UDP port. 14550 is the MAVLink standard and what Mission Planner
+// offers when you pick UDP.
+const uint16_t WIFI_UDP_PORT = 14550;        // default: 14550
+
+// Telemetry is gathered for up to this long before being sent as one
+// UDP packet, instead of firing a packet off per handful of bytes.
+// Higher batches harder and adds that much latency to the ground
+// station; it has no effect at all on the display.
+const uint32_t WIFI_FLUSH_MS = 10;           // default: 10
+
+// A ground station is treated as gone this long after its last packet,
+// after which telemetry goes back out as a broadcast.
+const uint32_t WIFI_GCS_TIMEOUT_MS = 5000;   // default: 5000
+
+// Show a small WIFI / GCS tag in the top right corner of the screen.
+const bool WIFI_SHOW_STATUS = true;          // default: true
 
 // ---------------------------------------------------------------------
 //  Units
@@ -595,9 +683,195 @@ uint32_t frameTimeAccumUs = 0;
 mavlink_message_t mavMsg;
 mavlink_status_t mavStatus;
 
-void receiveMavlink() {
-  while (Serial1.available() > 0) {
-    uint8_t b = Serial1.read();
+// ---------------------------------------------------------------------
+//  WiFi MAVLink bridge
+// ---------------------------------------------------------------------
+// Raw bytes in both directions. Telemetry from the flight controller is
+// gathered for up to WIFI_FLUSH_MS and sent as one UDP packet; anything
+// the ground station sends is written straight back out of the serial
+// port. Nothing here blocks: if WiFi never comes up, or no ground
+// station ever appears, the display is unaffected.
+
+void parseMavlinkBytes(const uint8_t *data, int len);   // defined below
+
+WiFiUDP udp;
+bool bridgeUp = false;             // WiFi came up and the socket is open
+IPAddress gcsIp;                   // last ground station we heard from
+bool gcsKnown = false;
+uint32_t lastGcsPacketMs = 0;
+uint32_t bytesToGcs = 0;           // counters, reported over USB serial
+uint32_t bytesToFc = 0;
+uint32_t uplinkDropped = 0;        // datagrams dropped, see pumpLink
+
+// Telemetry waiting to go out as one packet.
+uint8_t outbox[1024];
+int outboxLen = 0;
+uint32_t outboxSince = 0;
+
+bool gcsOnline() {
+  return gcsKnown && (millis() - lastGcsPacketMs) < WIFI_GCS_TIMEOUT_MS;
+}
+
+// Where to send telemetry: straight to the ground station once one has
+// identified itself, otherwise broadcast so it can find us.
+IPAddress telemetryTarget() {
+  if (gcsOnline()) return gcsIp;
+
+#if WIFI_BRIDGE_MODE == BRIDGE_AP
+  IPAddress ip = WiFi.softAPIP();
+  return IPAddress(ip[0], ip[1], ip[2], 255);
+#else
+  IPAddress ip = WiFi.localIP();
+  IPAddress nm = WiFi.subnetMask();
+  return IPAddress(ip[0] | ~nm[0], ip[1] | ~nm[1],
+                   ip[2] | ~nm[2], ip[3] | ~nm[3]);
+#endif
+}
+
+void flushToGcs() {
+  if (!bridgeUp || outboxLen == 0) return;
+  if (udp.beginPacket(telemetryTarget(), WIFI_UDP_PORT)) {
+    udp.write(outbox, outboxLen);
+    udp.endPacket();
+    bytesToGcs += outboxLen;
+  }
+  outboxLen = 0;
+}
+
+void queueToGcs(const uint8_t *data, int len) {
+  if (!bridgeUp) return;
+  while (len > 0) {
+    if (outboxLen == 0) outboxSince = millis();
+    int space = (int)sizeof(outbox) - outboxLen;
+    int n = (len < space) ? len : space;
+    memcpy(outbox + outboxLen, data, n);
+    outboxLen += n;
+    data += n;
+    len -= n;
+    if (outboxLen >= (int)sizeof(outbox)) flushToGcs();
+  }
+}
+
+void bridgeBegin() {
+  if (!WIFI_BRIDGE_ENABLE) {
+    Serial.println("WiFi bridge disabled");
+    return;
+  }
+
+  WiFi.persistent(false);   // don't wear out flash rewriting credentials
+  WiFi.setSleep(false);     // modem sleep adds latency we do not want
+
+#if WIFI_BRIDGE_MODE == BRIDGE_AP
+  WiFi.mode(WIFI_AP);
+  const char *pw = (strlen(WIFI_PASS) >= 8) ? WIFI_PASS : nullptr;
+  if (!WiFi.softAP(WIFI_SSID, pw, WIFI_AP_CHANNEL)) {
+    Serial.println("WiFi: softAP failed - running as a plain display");
+    return;
+  }
+  Serial.printf("WiFi AP '%s' up, board at %s, UDP %u\n",
+                WIFI_SSID, WiFi.softAPIP().toString().c_str(),
+                (unsigned)WIFI_UDP_PORT);
+  if (pw == nullptr) {
+    Serial.println("WiFi: OPEN network - anyone in range can command "
+                   "the aircraft");
+  }
+#else
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.printf("WiFi: joining '%s' ", WIFI_SSID);
+  uint32_t t0 = millis();
+  while (WiFi.status() != WL_CONNECTED &&
+         millis() - t0 < WIFI_STA_TIMEOUT_MS) {
+    delay(200);
+    Serial.print('.');
+  }
+  Serial.println();
+  if (WiFi.status() != WL_CONNECTED) {
+    // Not fatal. Give up on the bridge and just be a display.
+    Serial.println("WiFi: could not join - running as a plain display");
+    WiFi.mode(WIFI_OFF);
+    return;
+  }
+  Serial.printf("WiFi joined, board at %s, UDP %u\n",
+                WiFi.localIP().toString().c_str(),
+                (unsigned)WIFI_UDP_PORT);
+#endif
+
+  udp.begin(WIFI_UDP_PORT);
+  bridgeUp = true;
+}
+
+// Move bytes both ways. Called from loop() as often as possible, and
+// again right after a frame is pushed, since drawing blocks for tens of
+// milliseconds. Bounded so it can never spin: whatever is left over is
+// picked up on the next call, and the serial receive buffer holds it
+// meanwhile.
+void pumpLink() {
+  uint8_t buf[512];
+
+  // --- flight controller -> display parser and ground station ---
+  for (int round = 0; round < 4 && Serial1.available() > 0; round++) {
+    int n = 0;
+    while (n < (int)sizeof(buf) && Serial1.available() > 0) {
+      buf[n++] = (uint8_t)Serial1.read();
+    }
+    if (n <= 0) break;
+
+    queueToGcs(buf, n);
+
+    // The demo drives the display from its own simulated attitude, so
+    // real telemetry is bridged but not drawn.
+    if (!demoMode) parseMavlinkBytes(buf, n);
+  }
+
+  if (!bridgeUp) return;
+
+  // --- ground station -> flight controller ---
+  for (int round = 0; round < 8; round++) {
+    int len = udp.parsePacket();
+    if (len <= 0) break;
+
+    // Hearing anything at all is what marks the ground station live,
+    // even if the datagram itself turns out to be unusable below.
+    gcsIp = udp.remoteIP();
+    gcsKnown = true;
+    lastGcsPacketMs = millis();
+
+    if (len > (int)sizeof(buf)) {
+      // Implausibly large for MAVLink; drain it and move on.
+      while (udp.read(buf, sizeof(buf)) > 0) {}
+      uplinkDropped++;
+      continue;
+    }
+
+    int n = udp.read(buf, len);
+    if (n <= 0) continue;
+
+    // All of it or none of it. A half-written datagram would corrupt
+    // the byte stream the flight controller is parsing, whereas losing
+    // a whole one is just a lost packet, which MAVLink already expects
+    // and the ground station retries. Checking first also means the
+    // write never blocks and so never stalls a frame.
+    if ((int)Serial1.availableForWrite() >= n) {
+      Serial1.write(buf, n);
+      bytesToFc += n;
+    } else {
+      uplinkDropped++;
+    }
+  }
+
+  if (outboxLen > 0 && millis() - outboxSince >= WIFI_FLUSH_MS) {
+    flushToGcs();
+  }
+}
+
+// Feed received bytes through the MAVLink parser to keep the display
+// fed. The bridge forwards the same bytes separately and untouched, so
+// anything this function does not understand still reaches the ground
+// station intact.
+void parseMavlinkBytes(const uint8_t *data, int len) {
+  for (int i = 0; i < len; i++) {
+    uint8_t b = data[i];
 
     if (mavlink_parse_char(
           MAVLINK_COMM_0, b, &mavMsg, &mavStatus)) {
@@ -1171,6 +1445,20 @@ void drawHorizon(float roll, float pitch) {
     outlineString("DEMO", 6, 4, YELLOW);
   }
 
+  // Bridge state, top right. CYAN once a ground station is actually
+  // talking to us, YELLOW when WiFi is up but nothing has called in,
+  // RED if WiFi never came up at all.
+  if (WIFI_BRIDGE_ENABLE && WIFI_SHOW_STATUS) {
+    const char *tag;
+    uint16_t col;
+    if (!bridgeUp)        { tag = "NO WIFI"; col = RED; }
+    else if (gcsOnline()) { tag = "GCS";     col = CYAN; }
+    else                  { tag = "WIFI";    col = YELLOW; }
+    canvas.setFont(FONT_MEDIUM);
+    canvas.setTextDatum(textdatum_t::top_right);
+    outlineString(tag, W - 6, 4, col);
+  }
+
   // Warning pop-up goes on top of everything else.
   drawWarning();
 }
@@ -1449,9 +1737,19 @@ void setup() {
                 (unsigned)ESP.getFreeHeap(),
                 (unsigned)ESP.getFreePsram());
 
-  // RX receives the flight controller's TX. TX is initialized but
-  // never used to send anything.
+  // RX receives the flight controller's TX. TX is only actually used
+  // when the WiFi bridge is on. setRxBufferSize must come before
+  // begin() to have any effect.
+  Serial1.setRxBufferSize(MAV_RX_BUFFER);
+  Serial1.setTxBufferSize(MAV_TX_BUFFER);
   Serial1.begin(MAV_BAUD, SERIAL_8N1, MAV_RX_PIN, MAV_TX_PIN);
+
+  // WiFi goes up LAST, on purpose. Its stack wants tens of kilobytes,
+  // and the frame buffer needs one big contiguous block, so the frame
+  // buffer gets first claim on memory above.
+  bridgeBegin();
+  Serial.printf("Free heap after WiFi: %u bytes\n",
+                (unsigned)ESP.getFreeHeap());
 
   Serial.println("Cockpit display ready (ESP32-S3 / ILI9341)");
 }
@@ -1459,12 +1757,10 @@ void setup() {
 void loop() {
   pollButton();
 
-  if (demoMode) {
-    // Ignore real telemetry while the demo is running.
-    while (Serial1.available() > 0) Serial1.read();
-  } else {
-    receiveMavlink();
-  }
+  // Serve the link first: read the flight controller, forward to the
+  // ground station, and pass anything it sent back the other way. This
+  // runs every pass, far more often than the screen is redrawn.
+  pumpLink();
 
   uint32_t now = millis();
 
@@ -1493,6 +1789,11 @@ void loop() {
   frameTimeAccumUs += micros() - t0;
   frameCount++;
 
+  // Pushing a frame blocks for tens of milliseconds. Serve the link
+  // again immediately so the bytes that arrived meanwhile go straight
+  // out, rather than waiting behind the next frame.
+  pumpLink();
+
   // Debug information over USB serial, once a second.
   static uint32_t lastDebug = 0;
 
@@ -1503,9 +1804,17 @@ void loop() {
     unsigned long ageMs = lastAttitudeMs ? (now - lastAttitudeMs) : 0;
     Serial.printf(
       "ATTITUDE %lu Hz (age %lu ms) | roll %.1f (%.0f dps) pitch %.1f "
-      "| %lu fps, %.1f ms/frame\n",
+      "| %lu fps, %.1f ms/frame | link %s %lu B/s out %lu B/s in"
+      "%s\n",
       (unsigned long)attitudeCount, ageMs, rollDeg, rollRateDps, pitchDeg,
-      (unsigned long)frameCount, avgMs);
+      (unsigned long)frameCount, avgMs,
+      !WIFI_BRIDGE_ENABLE ? "off" : (!bridgeUp ? "down"
+                                   : (gcsOnline() ? "GCS" : "idle")),
+      (unsigned long)bytesToGcs, (unsigned long)bytesToFc,
+      uplinkDropped ? " [UPLINK DROPS]" : "");
+    bytesToGcs = 0;
+    bytesToFc = 0;
+    uplinkDropped = 0;
 
     attitudeCount = 0;
     frameCount = 0;

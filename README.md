@@ -48,6 +48,7 @@ is already set up for that board.
 | **Warnings** | Blinking low-battery and low-altitude pop-ups, plus a steady 5-second `ARMED` notice |
 | **Brightness** | Optionally driven from a spare R/C channel |
 | **Demo mode** | A simulated flight on the BOOT button — no flight controller needed |
+| **WiFi bridge** | Optional. Mission Planner over WiFi at the same time as the display |
 
 ### What's different from the original
 
@@ -61,6 +62,8 @@ is already set up for that board.
   blocks rather than one scanline at a time, which is most of the screen in
   near-level flight.
 - **Plain PWM backlight** instead of the T-Display-S3's AW9364 pulse-counting chip.
+- **WiFi MAVLink bridge**, so Mission Planner can talk to the aircraft over
+  WiFi through the same board, without interrupting the display.
 - 320×240 layout instead of 320×170.
 
 ---
@@ -73,7 +76,8 @@ is already set up for that board.
   The touch panel and SD slot are not used.
 - A flight controller running **ArduPilot Plane** with a free telemetry UART.
   Flight-mode names are ArduPlane's, QuadPlane modes included.
-- Three wires to the flight controller, nine to the display.
+- Three wires to the flight controller (four if you want the WiFi bridge),
+  nine to the display.
 - [Arduino IDE](https://www.arduino.cc/en/software) with ESP32 board support.
 
 ---
@@ -112,6 +116,7 @@ display needs — hence DC on GPIO 4, over on the right.
 | Flight controller | ESP32-S3 |
 |---|---|
 | Telemetry TX | GPIO 44 (RX) |
+| Telemetry RX | GPIO 43 (TX) &mdash; **only needed for the WiFi bridge** |
 | GND | GND |
 | 5V | 5V / VBUS |
 
@@ -236,6 +241,11 @@ written for feet.
 | `ARMED_NOTICE_MS` | `5000` | how long the `ARMED` pop-up shows. `0` disables |
 | `BRIGHT_RC_CHANNEL` | `0` | R/C channel (1–18) controlling brightness. `0` disables |
 | `TFT_SPI_FREQ` | `40000000` | SPI clock. `80000000` is faster but depends on your wiring |
+| `WIFI_BRIDGE_ENABLE` | `true` | WiFi MAVLink bridge. `false` = display only, no radio |
+| `WIFI_BRIDGE_MODE` | `BRIDGE_AP` | `BRIDGE_AP` makes its own network, `BRIDGE_STA` joins yours |
+| `WIFI_SSID` / `WIFI_PASS` | `cockpit-display` / `fpvcockpit` | Network name and password. Change them |
+| `WIFI_UDP_PORT` | `14550` | MAVLink standard; what Mission Planner expects |
+| `WIFI_FLUSH_MS` | `10` | Telemetry batching window. Affects the ground station only |
 | `PITCH_PIXELS_PER_DEGREE` | `5.0` | pitch scale. Higher = more sensitive |
 | `TEXT_OUTLINE` | `2` | black outline around text over the scene. `0` = solid box instead |
 | `OUTLINE` | `3` | black outline around every marking |
@@ -315,6 +325,84 @@ If it feels slow:
 
 ---
 
+## WiFi bridge — Mission Planner over the air
+
+Optional, on by default, and independent of the display: the board forwards
+raw MAVLink both ways between the flight controller's serial port and a UDP
+socket, so a ground station can connect over WiFi while the cockpit display
+carries on. Bytes are passed through untouched, so MAVLink 2, signing and any
+dialect all work.
+
+> [!IMPORTANT]
+> **The bridge needs one extra wire.** The display only ever listens, so a
+> display-only build needs just the flight controller's TX. A ground station
+> has to talk back, so the board's TX must reach the flight controller's RX:
+> **GPIO 43 &rarr; telemetry RX**. Without it you still get live telemetry in
+> Mission Planner, but it sits at "getting params" forever and you cannot
+> change anything on the aircraft.
+
+### Connecting (AP mode, the default)
+
+1. Power up the board. It creates a WiFi network called **`cockpit-display`**,
+   password **`fpvcockpit`** &mdash; change both in the sketch.
+2. Join that network from your laptop. The board is at **192.168.4.1**.
+3. In Mission Planner pick **UDP** from the connection dropdown, leave the port
+   at **14550**, and press **Connect**.
+
+The board broadcasts telemetry until a ground station speaks to it, then sends
+directly to that address, so Mission Planner finds it without being told an IP.
+
+Set `WIFI_BRIDGE_MODE` to `BRIDGE_STA` to join an existing network instead,
+which is handier at the bench because your laptop keeps its internet
+connection. Watch the USB serial output for the address it gets. If it cannot
+join within `WIFI_STA_TIMEOUT_MS` it gives up and runs as a plain display.
+
+### Reading the status tag
+
+Top right of the screen, when `WIFI_SHOW_STATUS` is on:
+
+| Tag | Colour | Meaning |
+|---|---|---|
+| `WIFI` | yellow | Bridge up, no ground station has called in yet |
+| `GCS` | cyan | A ground station is actively talking to the board |
+| `NO WIFI` | red | WiFi never came up; the display runs as normal |
+
+### Why it doesn't disturb the display
+
+- **Memory.** The 150 KB frame buffer is allocated *before* WiFi starts, so it
+  gets first claim on the one large contiguous block it needs. Everything
+  together comes to roughly half of the S3's 512 KB.
+- **Blocking writes.** Writing to a serial port stalls once the hardware FIFO
+  fills &mdash; about 9 ms per 100 bytes at 115200, easily long enough to freeze
+  a frame. The bridge checks `availableForWrite()` first and sends a datagram
+  only if all of it fits, so it never blocks. A datagram that will not fit is
+  dropped whole rather than half-written, because a truncated one would corrupt
+  the byte stream the flight controller is parsing; MAVLink expects loss and the
+  ground station retries. Drops are reported on USB serial as `[UPLINK DROPS]`.
+- **The frame blackout.** Nothing is read off the serial port for the ~25 ms it
+  takes to push a frame, so the receive buffer has to cover it. It is set to
+  8192 bytes: 711 ms at 115200, 89 ms at 921600. The Arduino default of 256
+  would be 22 ms and 3 ms respectively, and would drop bytes.
+- **Batching.** Telemetry is gathered for up to `WIFI_FLUSH_MS` and sent as one
+  UDP packet, which cuts the packet rate roughly 25-fold versus sending each
+  short read. It adds that much latency to the ground station and none to the
+  display.
+- **Cores.** WiFi runs on core 0, the Arduino loop on core 1, so the radio is
+  not competing with the drawing.
+
+### Before you fly with it
+
+- **Set a password.** An open network lets anyone in range command your
+  aircraft. The default has one; keep it or change it, but do not blank it.
+- **Check your current budget.** WiFi adds roughly 100&ndash;200 mA in bursts.
+  If the board browns out and resets mid-flight you lose the display, so make
+  sure the 5V supply has headroom.
+- **Know your local rules.** Running a WiFi AP on an aircraft is not legal
+  everywhere, and 2.4 GHz WiFi sits right on top of some R/C control links.
+  Range-test on the ground before trusting it in the air.
+- Set `WIFI_BRIDGE_ENABLE` to `false` for the display-only build, with no radio
+  powered at all.
+
 ## Latency
 
 The gap between the aircraft moving and the screen moving is the sum of a lot
@@ -373,6 +461,12 @@ ATTITUDE 50 Hz (age 12 ms) | roll -3.2 (-14 dps) pitch 1.8 | 30 fps, 18.4 ms/fra
 | Red and blue swapped | Set `cfg.rgb_order = true` in the `LGFX` class |
 | Board hangs at boot | Wrong PSRAM mode. Set PSRAM to **Disabled** |
 | `Waiting for MAVLINK` | Telemetry TX on GPIO 44, common ground, port set to MAVLink 2 at `MAV_BAUD` |
+| Mission Planner stuck at "getting params" | The GPIO 43 &rarr; telemetry RX wire is missing |
+| `NO WIFI` tag on screen | AP failed to start, or STA could not join. Check USB serial |
+| No WiFi network appears | `WIFI_BRIDGE_ENABLE` is `true`? Password is 8+ characters? |
+| Mission Planner will not connect | Laptop joined the board's network? UDP, port 14550? Firewall? |
+| `[UPLINK DROPS]` on serial | Serial port saturated upstream. Raise `SERIALn_BAUD` on the flight controller |
+| Board resets when WiFi starts | 5V supply cannot take the radio's current draw |
 | A readout shows `---` | That stream is enabled at 1 Hz or faster. Altitude also needs a GPS fix |
 | Text sits high or low in its box | Adjust `TEXT_Y_NUDGE` by a pixel or two |
 | Flight mode shows `MODE n` | Not an ArduPlane mode the sketch knows, or not a plane |
