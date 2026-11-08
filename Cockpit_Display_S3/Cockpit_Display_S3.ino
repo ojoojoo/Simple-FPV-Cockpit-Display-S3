@@ -1,10 +1,18 @@
 // =====================================================================
-//  Simple FPV Cockpit Display - ESP32-S3 / 2.8" ILI9341 SPI
+//  Simple-FPV-Cockpit-Display-S3
+//  Artificial horizon + WiFi MAVLink 2 bridge
+//  ESP32-S3 / 2.8" ILI9341 SPI
+//
+//  github.com/ojoojoo/Simple-FPV-Cockpit-Display-S3
 //
 //  A MAVLink artificial horizon for ArduPilot, meant to be filmed by
 //  an FPV camera. Shows roll and pitch, airspeed, altitude above home,
 //  arm state and flight mode, with pop-up warnings for low battery and
 //  low altitude.
+//
+//  The same board also bridges MAVLink 2 over WiFi, so Mission Planner
+//  can connect to the aircraft at the same time. See the WiFi section
+//  in the settings below; it needs one extra wire.
 //
 //  Ported from "Simple FPV Cockpit Display" by Keith Luneau
 //  (aka Bonafidepirate), originally written for the LilyGo

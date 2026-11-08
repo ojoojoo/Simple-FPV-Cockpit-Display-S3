@@ -1,12 +1,16 @@
-# Simple FPV Cockpit Display — ESP32-S3 + 2.8" ILI9341
+# [Simple-FPV-Cockpit-Display-S3](https://github.com/ojoojoo/Simple-FPV-Cockpit-Display-S3)
 
-**A MAVLink artificial horizon for ArduPilot planes, built to be filmed by your FPV camera.**
+**Artificial horizon and WiFi MAVLink 2 bridge for ArduPilot planes — ESP32-S3 + 2.8" ILI9341.**
 
 A tiny glass cockpit for the nose of your model. An ESP32-S3 reads MAVLink
 telemetry from the flight controller and draws an attitude indicator, airspeed,
 altitude above home, arm state and flight mode, with pop-up warnings for low
 battery and low altitude. Everything is drawn thick and outlined so it stays
 readable when a fixed-focus FPV camera films the screen from a few inches away.
+
+The same board doubles as a **WiFi MAVLink 2 bridge**, so Mission Planner can
+connect to the aircraft over the air at the same time, without interrupting
+the display.
 
 Lettering is set in **[B612](https://b612-font.com/)** — the typeface Airbus and
 ENAC designed for aircraft cockpit screens.
